@@ -1,0 +1,325 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/chzyer/readline"
+	_ "github.com/lib/pq"
+	"github.com/pquerna/otp/totp"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// Global state for session management
+var (
+	db             *sql.DB
+	loggedInUser   string
+	lastActivity   time.Time
+	sessionTimeout = 15 * time.Minute
+)
+
+// User represents the database schema for a user
+type User struct {
+	Username      string
+	PasswordHash  string
+	TOTPSecret    sql.NullString
+	TOTPEnabled   bool
+	FailedAttempts int
+	LockedUntil   sql.NullTime
+	CreatedAt     time.Time
+	LastLogin     sql.NullTime
+}
+
+func main() {
+	initDB()
+	defer db.Close()
+
+	// Setup tab completion
+	var completer = readline.NewPrefixCompleter(
+		readline.PcItem("register"),
+		readline.PcItem("login"),
+		readline.PcItem("help"),
+		readline.PcItem("exit"),
+		readline.PcItem("whoami"),
+		readline.PcItem("enable-2fa"),
+		readline.PcItem("disable-2fa"),
+		readline.PcItem("logout"),
+	)
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "\033[31m>\033[0m ",
+		HistoryFile:     "/tmp/readline.tmp",
+		AutoComplete:    completer,
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer rl.Close()
+
+	fmt.Println("Welcome to the Secure CLI. Type 'help' for available commands.")
+
+	for {
+		// Dynamic prompt based on auth state
+		if loggedInUser != "" {
+			rl.SetPrompt(fmt.Sprintf("\033[32m%s@cli\033[0m> ", loggedInUser))
+		} else {
+			rl.SetPrompt("\033[31m>\033[0m ")
+		}
+
+		line, err := rl.Readline()
+		if err != nil { // EOF or Ctrl+C
+			break
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Session Timeout Check
+		if loggedInUser != "" {
+			if time.Since(lastActivity) > sessionTimeout {
+				fmt.Println("[-] Session expired due to inactivity. Please log in again.")
+				loggedInUser = ""
+				continue
+			}
+			lastActivity = time.Now() // Reset timer on activity
+		}
+
+		args := strings.Split(line, " ")
+		command := args[0]
+
+		if loggedInUser == "" {
+			handleUnauthenticatedCommands(command, rl)
+		} else {
+			handleAuthenticatedCommands(command, rl)
+		}
+	}
+}
+
+// ===========================
+// Command Handlers
+// ===========================
+
+func handleUnauthenticatedCommands(command string, rl *readline.Instance) {
+	switch command {
+	case "register":
+		registerUser(rl)
+	case "login":
+		loginUser(rl)
+	case "help":
+		fmt.Println("Available commands: register, login, help, exit")
+	case "exit":
+		os.Exit(0)
+	default:
+		fmt.Println("[-] Unknown command or you need to log in first.")
+	}
+}
+
+func handleAuthenticatedCommands(command string, rl *readline.Instance) {
+	switch command {
+	case "whoami":
+		showUserDetails()
+	case "enable-2fa":
+		enable2FA(rl)
+	case "disable-2fa":
+		disable2FA(rl)
+	case "logout":
+		loggedInUser = ""
+		fmt.Println("[+] Logged out successfully.")
+	case "help":
+		fmt.Println("Available commands: whoami, enable-2fa, disable-2fa, logout, help, exit")
+	case "exit":
+		os.Exit(0)
+	default:
+		fmt.Println("[-] Unknown command.")
+	}
+}
+
+// ===========================
+// Authentication Logic
+// ===========================
+
+func registerUser(rl *readline.Instance) {
+	rl.SetPrompt("Username: ")
+	username, _ := rl.Readline()
+	
+	rl.SetPrompt("Password: ")
+	cfg := rl.GenPasswordConfig()
+	passwordBytes, _ := rl.ReadPasswordWithConfig(cfg)
+	
+	hash, err := bcrypt.GenerateFromPassword(passwordBytes, bcrypt.DefaultCost)
+	if err != nil {
+		fmt.Println("[-] Error hashing password")
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO users (username, password_hash) VALUES ($1, $2)", username, string(hash))
+	if err != nil {
+		fmt.Println("[-] Username may already exist.")
+		return
+	}
+	fmt.Println("[+] Registration successful! You can now log in.")
+}
+
+func loginUser(rl *readline.Instance) {
+	rl.SetPrompt("Username: ")
+	username, _ := rl.Readline()
+
+	var user User
+	err := db.QueryRow("SELECT password_hash, totp_enabled, totp_secret, failed_attempts, locked_until FROM users WHERE username = $1", username).
+		Scan(&user.PasswordHash, &user.TOTPEnabled, &user.TOTPSecret, &user.FailedAttempts, &user.LockedUntil)
+
+	if err == sql.ErrNoRows {
+		fmt.Println("[-] Invalid username or password.")
+		return
+	}
+
+	// Check Lockout
+	if user.LockedUntil.Valid && user.LockedUntil.Time.After(time.Now()) {
+		fmt.Printf("[-] Account is locked until %s. Try again later.\n", user.LockedUntil.Time.Format(time.RFC1123))
+		return
+	}
+
+	rl.SetPrompt("Password: ")
+	cfg := rl.GenPasswordConfig()
+	passwordBytes, _ := rl.ReadPasswordWithConfig(cfg)
+
+	// Validate Password
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), passwordBytes); err != nil {
+		// Increment failed attempts
+		newAttempts := user.FailedAttempts + 1
+		if newAttempts >= 3 {
+			lockoutTime := time.Now().Add(5 * time.Minute)
+			db.Exec("UPDATE users SET failed_attempts = 0, locked_until = $1 WHERE username = $2", lockoutTime, username)
+			fmt.Println("[-] Maximum attempts reached. Account locked for 5 minutes.")
+		} else {
+			db.Exec("UPDATE users SET failed_attempts = $1 WHERE username = $2", newAttempts, username)
+			fmt.Printf("[-] Invalid credentials. Attempt %d of 3.\n", newAttempts)
+		}
+		return
+	}
+
+	// Handle 2FA
+	if user.TOTPEnabled {
+		rl.SetPrompt("Enter 2FA Code: ")
+		code, _ := rl.Readline()
+		valid := totp.Validate(strings.TrimSpace(code), user.TOTPSecret.String)
+		if !valid {
+			fmt.Println("[-] Invalid 2FA code.")
+			return
+		}
+	}
+
+	// Login Success
+	db.Exec("UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login = $1 WHERE username = $2", time.Now(), username)
+	loggedInUser = strings.TrimSpace(username)
+	lastActivity = time.Now()
+	fmt.Println("[+] Login successful!")
+	showUserDetails()
+}
+
+// ===========================
+// Post-Login Actions
+// ===========================
+
+func showUserDetails() {
+	var u User
+	db.QueryRow("SELECT username, created_at, totp_enabled, last_login FROM users WHERE username = $1", loggedInUser).
+		Scan(&u.Username, &u.CreatedAt, &u.TOTPEnabled, &u.LastLogin)
+
+	fmt.Println("\n--- User Details ---")
+	fmt.Printf("Username: %s\n", u.Username)
+	fmt.Printf("Registration Date: %s\n", u.CreatedAt.Format(time.RFC822))
+	mfaStatus := "Disabled"
+	if u.TOTPEnabled {
+		mfaStatus = "Enabled"
+	}
+	fmt.Printf("MFA Status: %s\n", mfaStatus)
+	
+	expiration := lastActivity.Add(sessionTimeout)
+	fmt.Printf("Session Expiration: %s\n", expiration.Format(time.RFC822))
+	if u.LastLogin.Valid {
+		fmt.Printf("Last Login: %s\n", u.LastLogin.Time.Format(time.RFC822))
+	}
+	fmt.Println("--------------------")
+}
+
+func enable2FA(rl *readline.Instance) {
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "CLIAuthSystem",
+		AccountName: loggedInUser,
+	})
+	if err != nil {
+		fmt.Println("[-] Failed to generate 2FA key.")
+		return
+	}
+
+	fmt.Printf("\n[!] Add this secret to your Authenticator App: %s\n", key.Secret())
+	
+	rl.SetPrompt("Enter the code from your app to confirm: ")
+	code, _ := rl.Readline()
+	
+	if totp.Validate(strings.TrimSpace(code), key.Secret()) {
+		db.Exec("UPDATE users SET totp_secret = $1, totp_enabled = TRUE WHERE username = $2", key.Secret(), loggedInUser)
+		fmt.Println("[+] 2FA successfully enabled!")
+	} else {
+		fmt.Println("[-] Invalid code. 2FA not enabled.")
+	}
+}
+
+func disable2FA(rl *readline.Instance) {
+	db.Exec("UPDATE users SET totp_secret = NULL, totp_enabled = FALSE WHERE username = $1", loggedInUser)
+	fmt.Println("[+] 2FA successfully disabled.")
+}
+
+// ===========================
+// Database Setup
+// ===========================
+
+func initDB() {
+	connStr := os.Getenv("DATABASE_URL")
+	if connStr == "" {
+		connStr = "postgres://postgres:password@localhost:5432/cli_auth?sslmode=disable"
+	}
+
+	var err error
+	// Retry loop to wait for postgres container to be ready
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err == nil {
+			err = db.Ping()
+			if err == nil {
+				break
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	schema := `
+	CREATE TABLE IF NOT EXISTS users (
+		id SERIAL PRIMARY KEY,
+		username VARCHAR(255) UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		totp_secret TEXT,
+		totp_enabled BOOLEAN DEFAULT FALSE,
+		failed_attempts INT DEFAULT 0,
+		locked_until TIMESTAMP,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		last_login TIMESTAMP
+	);`
+
+	_, err = db.Exec(schema)
+	if err != nil {
+		log.Fatalf("Failed to execute migrations: %v", err)
+	}
+}

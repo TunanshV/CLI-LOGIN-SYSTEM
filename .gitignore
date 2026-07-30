@@ -1,0 +1,19 @@
+# Go binaries
+cli-app
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Mac OS
+.DS_Store
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

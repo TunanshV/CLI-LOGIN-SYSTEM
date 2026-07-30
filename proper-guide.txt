@@ -1,0 +1,28 @@
+Usage Guide
+Before Login
+
+    register: Prompts for a new username and password.
+
+    login: Prompts for credentials (and a 2FA code if enabled).
+
+    help: Lists available commands.
+
+    exit: Shuts down the application.
+
+After Login
+
+    whoami: Displays current user details, session expiry, and MFA status.
+
+    enable-2fa: Generates a secret key for Google Authenticator and verifies it.
+
+    disable-2fa: Turns off multi-factor authentication.
+
+    logout: Ends the current session.
+
+Features Implemented
+
+    Persistence: PostgreSQL database runs in a container with a mounted volume (pgdata), ensuring data survives restarts.
+
+    Security: Passwords hashed via bcrypt. Accounts lock for 5 minutes after 3 failed login attempts.
+
+    Interactivity: Utilizes chzyer/readline for tab-completion, dynamic prompts, and hidden password inputs.
