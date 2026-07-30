@@ -13,4 +13,5 @@ A secure, interactive command-line login system written in Go. Features include 
    docker-compose up -d
 
   then followed by the command
+
   docker attach cli_app
